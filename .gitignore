@@ -7,3 +7,10 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地运行产生的任务数据库
+tasks.db
+tasks.db-*
+*.db-wal
+*.db-shm
+/restart-demo.db*
