@@ -34,7 +34,24 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_task ON task_events (task_id, id);
+
+CREATE TABLE IF NOT EXISTS task_progress (
+    task_id     TEXT PRIMARY KEY,
+    epoch       INTEGER NOT NULL,
+    percent     REAL,
+    step        TEXT,
+    message     TEXT,
+    updated_at  TEXT NOT NULL
+);
 """
+
+# 旧库就地升级：新增列若不存在则 ALTER TABLE 补齐（SQLite 不支持 IF NOT EXISTS 加列）
+_MIGRATIONS = (
+    ("tasks", "epoch", "ALTER TABLE tasks ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "cancel_requested",
+     "ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "cancel_requested_by", "ALTER TABLE tasks ADD COLUMN cancel_requested_by TEXT"),
+)
 
 
 class Database:
@@ -51,6 +68,13 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        for table, column, ddl in _MIGRATIONS:
+            cols = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self._conn.execute(ddl)
 
     @property
     def conn(self) -> sqlite3.Connection:

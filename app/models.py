@@ -15,7 +15,9 @@ class TaskStatus(str, enum.Enum):
       RUNNING   -> SUCCEEDED          (执行成功)
       RUNNING   -> PENDING            (失败重试，带退避)
       RUNNING   -> DEAD               (超过重试上限 / 超时 / 业务明确失败)
-      RUNNING   -> PENDING            (租约过期被回收，进程重启恢复)
+      RUNNING   -> CANCELLED          (运行中被请求取消，执行者确认收敛)
+      RUNNING   -> RUNNING            (租约续期 / 取消标记置位，不计入跃迁表，
+                                       以事件流水记录)
       DEAD      -> PENDING            (人工重放，保留历史)
     终态：SUCCEEDED / CANCELLED。DEAD 可经人工重放回到 PENDING。
     """
@@ -31,7 +33,9 @@ TERMINAL_STATUSES = frozenset({TaskStatus.SUCCEEDED, TaskStatus.CANCELLED})
 
 ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.PENDING: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
-    TaskStatus.RUNNING: frozenset({TaskStatus.SUCCEEDED, TaskStatus.PENDING, TaskStatus.DEAD}),
+    TaskStatus.RUNNING: frozenset({
+        TaskStatus.SUCCEEDED, TaskStatus.PENDING, TaskStatus.DEAD, TaskStatus.CANCELLED,
+    }),
     TaskStatus.DEAD: frozenset({TaskStatus.PENDING}),
     TaskStatus.SUCCEEDED: frozenset(),
     TaskStatus.CANCELLED: frozenset(),
@@ -71,6 +75,10 @@ class BusinessFailure(Exception):
     """业务处理器显式抛出的明确失败：不重试，直接进入死信。"""
 
 
+class TaskCancelled(Exception):
+    """业务处理器感知到取消请求后主动抛出：任务收敛到 CANCELLED 终态。"""
+
+
 @dataclass(frozen=True)
 class Task:
     id: str
@@ -86,6 +94,24 @@ class Task:
     created_at: datetime
     updated_at: datetime
     last_error: str | None = None
+    # 执行纪元：每次被抢占（claim）时 +1。进度上报与租约续期必须携带当前
+    # 纪元，来自上一纪元的迟到的写入会被拒绝，避免旧执行者污染新一轮执行。
+    epoch: int = 0
+    # 运行中取消标记：请求方置位，执行者感知后收敛到 CANCELLED。
+    cancel_requested: bool = False
+    cancel_requested_by: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskProgress:
+    """一次执行纪元内的最新进度快照。未上报过时查询返回 None（未知）。"""
+
+    task_id: str
+    epoch: int
+    percent: float | None
+    step: str | None
+    message: str | None
+    updated_at: datetime
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,4 @@
-"""HTTP API：任务提交 / 查询 / 取消 / 死信重放 / 状态流水。"""
+"""HTTP API：任务提交 / 查询 / 进度 / 取消 / 死信重放 / 状态流水。"""
 from __future__ import annotations
 
 from typing import Any
@@ -13,6 +13,7 @@ from .models import (
     TaskAlreadyTerminalError,
     TaskEvent,
     TaskNotFoundError,
+    TaskProgress,
     TaskStatus,
 )
 from .repository import TaskRepository
@@ -33,12 +34,33 @@ class TaskView(BaseModel):
     attempt: int
     max_attempts: int
     last_error: str | None
+    cancel_requested: bool
 
     @classmethod
     def of(cls, t: Task) -> "TaskView":
         return cls(id=t.id, idempotency_key=t.idempotency_key, task_type=t.task_type,
                    status=t.status.value, attempt=t.attempt,
-                   max_attempts=t.max_attempts, last_error=t.last_error)
+                   max_attempts=t.max_attempts, last_error=t.last_error,
+                   cancel_requested=t.cancel_requested)
+
+
+class ProgressView(BaseModel):
+    """进度查询结果。reported=false 表示该执行纪元尚未上报过（未知），不报错。"""
+
+    task_id: str
+    reported: bool
+    percent: float | None = None
+    step: str | None = None
+    message: str | None = None
+    updated_at: str | None = None
+
+    @classmethod
+    def of(cls, task_id: str, p: TaskProgress | None) -> "ProgressView":
+        if p is None:
+            return cls(task_id=task_id, reported=False)
+        return cls(task_id=task_id, reported=True, percent=p.percent,
+                   step=p.step, message=p.message,
+                   updated_at=p.updated_at.isoformat())
 
 
 class EventView(BaseModel):
@@ -92,10 +114,21 @@ def create_router(repo: TaskRepository) -> APIRouter:
             raise _to_http(exc) from exc
         return [EventView.of(e) for e in repo.list_events(task_id)]
 
+    @router.get("/tasks/{task_id}/progress")
+    def progress(task_id: str):
+        """查询当前执行纪元的进度；未上报过返回 reported=false（未知）。"""
+        try:
+            return ProgressView.of(task_id, repo.get_progress(task_id))
+        except DomainError as exc:
+            raise _to_http(exc) from exc
+
     @router.post("/tasks/{task_id}/cancel")
     def cancel(task_id: str):
+        """请求取消：PENDING 立即取消；RUNNING 置取消标记（返回 200 且
+        cancel_requested=true，任务随后收敛到 CANCELLED）；终态/DEAD 返回
+        409 + 可区分 code。"""
         try:
-            return TaskView.of(repo.cancel(task_id))
+            return TaskView.of(repo.request_cancel(task_id))
         except DomainError as exc:
             raise _to_http(exc) from exc
 
