@@ -155,14 +155,13 @@ def test_cancel_rules(repo):
         repo.cancel(t.id)
     assert ei.value.code == "task_already_terminal"
 
-    # RUNNING 状态不可取消：非法跃迁
+    # RUNNING 状态取消：两阶段——先置取消标记（长任务支持），不再是非法跃迁
     t2, _ = repo.submit("echo", {}, "k-cancel-2")
     repo.claim("w-x", 10)
-    with pytest.raises(InvalidTransitionError) as ei2:
-        repo.cancel(t2.id)
-    assert ei2.value.code == "invalid_transition"
+    requested = repo.cancel(t2.id)
+    assert requested.status is TaskStatus.RUNNING and requested.cancel_requested
 
     # 死信重放的非法跃迁：非 DEAD 不可 replay
     with pytest.raises(InvalidTransitionError):
         repo.replay(t2.id)
-    dump_flow(repo, t.id, "重复取消被拒绝 task_already_terminal；RUNNING 取消被拒绝 invalid_transition")
+    dump_flow(repo, t.id, "重复取消被拒绝 task_already_terminal；RUNNING 取消转为取消标记")

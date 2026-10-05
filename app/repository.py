@@ -9,11 +9,13 @@ from .db import Database
 from .models import (
     ALLOWED_TRANSITIONS,
     TERMINAL_STATUSES,
+    CancelAlreadyRequestedError,
     InvalidTransitionError,
     Task,
     TaskAlreadyTerminalError,
     TaskEvent,
     TaskNotFoundError,
+    TaskProgress,
     TaskStatus,
 )
 
@@ -45,6 +47,7 @@ def _row_to_task(row) -> Task:
         created_at=_parse(row["created_at"]),
         updated_at=_parse(row["updated_at"]),
         last_error=row["last_error"],
+        cancel_requested=bool(row["cancel_requested"]),
     )
 
 
@@ -149,7 +152,7 @@ class TaskRepository:
                 # 条件更新保证同一任务只被一个执行者抢占
                 cur = self._db.conn.execute(
                     """UPDATE tasks SET status=?, lease_owner=?, lease_expires_at=?,
-                          attempt=attempt+1, updated_at=?
+                          attempt=attempt+1, cancel_requested=0, updated_at=?
                        WHERE id=? AND status=? AND
                              (lease_expires_at IS NULL OR lease_expires_at <= ? OR lease_owner=?)""",
                     (TaskStatus.RUNNING.value, worker_id, _iso(lease_exp), _iso(now),
@@ -160,6 +163,9 @@ class TaskRepository:
                     reason = ("claimed" if frm == TaskStatus.PENDING
                               else "lease expired, reclaimed after crash")
                     self._append_event(row["id"], frm, TaskStatus.RUNNING, reason, worker_id)
+                    # 新一轮运行开始：上一轮残留的进度作废，从“未知”重新计
+                    self._db.conn.execute(
+                        "DELETE FROM task_progress WHERE task_id=?", (row["id"],))
                     claimed.append(self.get(row["id"]))
         return claimed
 
@@ -219,12 +225,31 @@ class TaskRepository:
             return self.get(task_id)
 
     def cancel(self, task_id: str, actor: str = "api") -> Task:
-        """取消。仅 PENDING 可取消；终态重复取消会被拒绝并给出可区分原因。"""
+        """请求取消。
+
+        - PENDING：直接落 CANCELLED（终态）；
+        - RUNNING：两阶段——先置 cancel_requested 标记（状态仍 RUNNING），
+          执行中的任务感知并停下后由持有者收敛到 CANCELLED；
+        - 重复请求（RUNNING 且已置标记）：CancelAlreadyRequestedError；
+        - 终态（SUCCEEDED/CANCELLED）：TaskAlreadyTerminalError；
+        - DEAD：InvalidTransitionError（死信只能重放，不能取消）。
+        三类拒绝原因可区分。
+        """
         with self._db.lock, self._db.conn:
             task = self.get(task_id)
             if task.status in TERMINAL_STATUSES:
                 raise TaskAlreadyTerminalError(task_id, task.status)
             if task.status is TaskStatus.RUNNING:
+                if task.cancel_requested:
+                    raise CancelAlreadyRequestedError(task_id)
+                self._db.conn.execute(
+                    "UPDATE tasks SET cancel_requested=1, updated_at=? WHERE id=?",
+                    (_iso(_now()), task_id),
+                )
+                self._append_event(task_id, TaskStatus.RUNNING, TaskStatus.RUNNING,
+                                   "cancel requested, waiting for task to stop", actor)
+                return self.get(task_id)
+            if task.status is TaskStatus.DEAD:
                 raise InvalidTransitionError(task_id, task.status, TaskStatus.CANCELLED)
             self._db.conn.execute(
                 "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
@@ -234,8 +259,79 @@ class TaskRepository:
                                "cancelled by requester", actor)
             return self.get(task_id)
 
+    # ---------- 长任务：进度 / 租约续期 / 运行中取消 ----------
+
+    def report_progress(self, task_id: str, worker_id: str,
+                        percent: float | None, step: str | None) -> None:
+        """执行中上报进度（upsert）。仅当前租约持有者可上报，避免回收后旧执行者写脏数据。"""
+        now = _now()
+        with self._db.lock, self._db.conn:
+            task = self.get(task_id)
+            self._assert_owner(task, worker_id)
+            self._db.conn.execute(
+                """INSERT INTO task_progress (task_id, percent, step, updated_at)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(task_id) DO UPDATE SET
+                       percent=excluded.percent, step=excluded.step,
+                       updated_at=excluded.updated_at""",
+                (task_id, percent, step, _iso(now)),
+            )
+
+    def get_progress(self, task_id: str) -> TaskProgress | None:
+        """查询进度快照；从未上报过返回 None（对外为“未知”），不报错。"""
+        with self._db.lock:
+            row = self._db.conn.execute(
+                "SELECT * FROM task_progress WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return TaskProgress(task_id=row["task_id"], percent=row["percent"],
+                            step=row["step"], updated_at=_parse(row["updated_at"]))
+
+    def renew_lease(self, task_id: str, worker_id: str, lease_seconds: float) -> bool:
+        """长任务执行期间续租。返回是否仍持有租约（False 表示已被回收/状态已变）。"""
+        now = _now()
+        lease_exp = now + timedelta(seconds=lease_seconds)
+        with self._db.lock, self._db.conn:
+            cur = self._db.conn.execute(
+                """UPDATE tasks SET lease_expires_at=?, updated_at=?
+                   WHERE id=? AND status=? AND lease_owner=?""",
+                (_iso(lease_exp), _iso(now), task_id,
+                 TaskStatus.RUNNING.value, worker_id),
+            )
+            return cur.rowcount == 1
+
+    def is_cancel_requested(self, task_id: str) -> bool:
+        """执行器心跳轮询用：该任务是否被请求取消。"""
+        with self._db.lock:
+            row = self._db.conn.execute(
+                "SELECT cancel_requested FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        return bool(row and row["cancel_requested"])
+
+    def complete_cancel(self, task_id: str, worker_id: str) -> Task:
+        """运行中的任务感知取消并停下后，由持有者收敛到 CANCELLED。
+
+        幂等防护：若任务已被并发地以其他方式终结（如刚好成功），
+        当前状态不是 RUNNING 时抛 InvalidTransitionError，由执行器按既成事实记录日志。
+        """
+        with self._db.lock, self._db.conn:
+            task = self.get(task_id)
+            self._assert_owner(task, worker_id)
+            if not task.cancel_requested:
+                raise InvalidTransitionError(task_id, task.status, TaskStatus.CANCELLED)
+            self._db.conn.execute(
+                """UPDATE tasks SET status=?, lease_owner=NULL, lease_expires_at=NULL,
+                      cancel_requested=0, updated_at=? WHERE id=?""",
+                (TaskStatus.CANCELLED.value, _iso(_now()), task_id),
+            )
+            self._append_event(task_id, TaskStatus.RUNNING, TaskStatus.CANCELLED,
+                               "cancel requested acknowledged, task stopped", worker_id)
+            return self.get(task_id)
+
     def replay(self, task_id: str, actor: str = "operator") -> Task:
-        """人工重放死信：DEAD -> PENDING，attempt 归零，历史事件完整保留。"""
+        """人工重放死信：DEAD -> PENDING，attempt 归零，历史事件完整保留。
+        同时清空取消标记与进度快照：重放后的新运行进度从头开始算。"""
         with self._db.lock, self._db.conn:
             task = self.get(task_id)
             if task.status is not TaskStatus.DEAD:
@@ -243,11 +339,14 @@ class TaskRepository:
             now = _now()
             self._db.conn.execute(
                 """UPDATE tasks SET status=?, attempt=0, run_at=?, lease_owner=NULL,
-                      lease_expires_at=NULL, last_error=NULL, updated_at=? WHERE id=?""",
+                      lease_expires_at=NULL, last_error=NULL, cancel_requested=0,
+                      updated_at=? WHERE id=?""",
                 (TaskStatus.PENDING.value, _iso(now), _iso(now), task_id),
             )
+            self._db.conn.execute(
+                "DELETE FROM task_progress WHERE task_id=?", (task_id,))
             self._append_event(task_id, TaskStatus.DEAD, TaskStatus.PENDING,
-                               "manual replay, history preserved", actor)
+                               "manual replay, history preserved, progress reset", actor)
             return self.get(task_id)
 
     # ---------- 内部 ----------

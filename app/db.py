@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     lease_owner     TEXT,
     lease_expires_at TEXT,
     last_error      TEXT,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -34,7 +35,19 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_task ON task_events (task_id, id);
+
+CREATE TABLE IF NOT EXISTS task_progress (
+    task_id     TEXT PRIMARY KEY,
+    percent     REAL,
+    step        TEXT,
+    updated_at  TEXT NOT NULL
+);
 """
+
+# 旧库升级：tasks 表缺少新增列时补齐（幂等）
+_MIGRATIONS = (
+    "ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+)
 
 
 class Database:
@@ -51,6 +64,11 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
+            for stmt in _MIGRATIONS:
+                try:
+                    self._conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # 列已存在
 
     @property
     def conn(self) -> sqlite3.Connection:
